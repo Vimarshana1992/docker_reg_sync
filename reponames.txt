@@ -1,0 +1,4 @@
+#include all the required repositories to sync here
+hello-world
+alpine
+nginx

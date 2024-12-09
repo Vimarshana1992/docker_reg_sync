@@ -1,0 +1,111 @@
+#!/bin/bash
+
+# Configuration
+SOURCE_REPO="192.168.48.129:5000"
+TARGET_REPO="192.168.48.129:6000"
+REPO_NAMES_FILE="/home/ubuntu/docreg/reponames"   # File containing repository names
+TAG_TRACK_DIR="/home/ubuntu/docreg/tags"          # Directory to track processed tags for each repository
+
+# Functions
+log() {
+    echo "$(date +"%Y-%m-%d %H:%M:%S") - $1"
+}
+
+verify_repo_exists() {
+    local repo=$1
+    response=$(curl -s "https://$SOURCE_REPO/v2/$repo/tags/list")
+    if echo "$response" | jq -e '.errors' &>/dev/null; then
+        log "Error: Repository '$repo' does not exist in the source registry."
+        return 1
+    fi
+    return 0
+}
+
+fetch_repo_tags() {
+    local repo=$1
+    # Fetch tags for the given repository
+    curl -s "https://$SOURCE_REPO/v2/$repo/tags/list" | jq -r '.tags[]' || log "Failed to fetch tags for $repo"
+
+}
+
+pull_and_retag_image() {
+    local repo=$1
+    local tag=$2
+    log "Pulling $repo:$tag from $SOURCE_REPO"
+    docker pull "$SOURCE_REPO/$repo:$tag"
+    log "Tagging $repo:$tag as $TARGET_REPO/$repo:$tag"
+    docker tag "$SOURCE_REPO/$repo:$tag" "$TARGET_REPO/$repo:$tag"
+    log "Pushing $repo:$tag to $TARGET_REPO"
+    docker push "$TARGET_REPO/$repo:$tag"
+}
+
+# Check dependencies
+if ! command -v jq &> /dev/null; then
+    log "Error: 'jq' is not installed. Install it to proceed."
+    exit 1
+fi
+
+if ! command -v docker &> /dev/null; then
+    log "Error: 'docker' is not installed. Install it to proceed."
+    exit 1
+fi
+
+# Validate REPO_NAMES_FILE
+if [ ! -f "$REPO_NAMES_FILE" ]; then
+    log "Error: Repository names file $REPO_NAMES_FILE not found."
+    exit 1
+fi
+
+# Ensure the tag tracking directory exists
+mkdir -p "$TAG_TRACK_DIR"
+
+# Verify all repositories in the reponames file exist
+log "Verifying existence of all repositories in the source registry."
+while read -r repo; do
+    if [ -z "$repo" ]; then
+        continue # Skip empty lines
+    fi
+    verify_repo_exists "$repo"
+    if [ $? -ne 0 ]; then
+        log "Exiting script due to missing repository: $repo in $SOURCE_REPO registry."
+        exit 1
+    fi
+done < "$REPO_NAMES_FILE"
+log "All repositories exist in the source registry. Proceeding with sync."
+
+# Process each repository in the REPO_NAMES_FILE
+while read -r repo; do
+    if [ -z "$repo" ]; then
+        continue # Skip empty lines
+    fi
+
+    log "Processing repository: $repo"
+
+    # File to track processed tags for this repository
+    TAG_FILE="$TAG_TRACK_DIR/${repo}_tags.txt"
+    if [ ! -f "$TAG_FILE" ]; then
+        touch "$TAG_FILE"
+    fi
+
+    # Get the existing tags for this repository
+    existing_tags=$(cat "$TAG_FILE")
+
+    # Fetch the latest tags for this repository
+    latest_tags=$(fetch_repo_tags "$repo")
+
+    # Find new tags
+    new_tags=$(comm -23 <(echo "$latest_tags" | sort) <(echo "$existing_tags" | sort))
+
+    # Process new tags
+    if [ -z "$new_tags" ]; then
+        log "No new tags found for repository: $repo."
+    else
+        log "New tags found for repository $repo: $new_tags"
+        for tag in $new_tags; do
+            pull_and_retag_image "$repo" "$tag"
+            echo "$tag" >> "$TAG_FILE"
+        done
+    fi
+done < "$REPO_NAMES_FILE"
+
+log "SUCCESS-Sync completed for all repositories."
